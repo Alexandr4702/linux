@@ -80,6 +80,7 @@ struct pivariety {
 	int lanes;
 	int bayer_order_volatile;
 	bool wait_until_free;
+	bool legacy_uc689;
 
 	struct v4l2_ctrl_handler ctrl_handler;
 	struct v4l2_ctrl *ctrls[MAX_CTRLS];
@@ -204,6 +205,10 @@ static int wait_for_free(struct pivariety *pivariety, int interval)
 {
 	u32 value;
 	u32 count = 0;
+
+	/* Firmware 0x10003 does not implement SYSTEM_IDLE_REG. */
+	if (pivariety->legacy_uc689)
+		return 0;
 
 	while (count++ < (1000 / interval)) {
 		int ret = pivariety_read(pivariety, SYSTEM_IDLE_REG, &value);
@@ -1186,6 +1191,25 @@ static struct v4l2_ctrl *v4l2_ctrl_new_arducam(struct v4l2_ctrl_handler *hdl,
 	return v4l2_ctrl_new_custom(hdl, &ctrl_cfg, NULL);
 }
 
+static int pivariety_init_legacy_controls(struct pivariety *pivariety)
+{
+	struct v4l2_ctrl_handler *ctrl_hdlr = &pivariety->ctrl_handler;
+	int ret;
+
+	/*
+	 * UC-689 Rev.A firmware predates the controller control table. Keep an
+	 * empty handler so that streaming can use the normal V4L2 code path.
+	 */
+	ret = v4l2_ctrl_handler_init(ctrl_hdlr, 0);
+	if (ret)
+		return ret;
+
+	mutex_init(&pivariety->mutex);
+	pivariety->sd.ctrl_handler = ctrl_hdlr;
+
+	return 0;
+}
+
 static int pivariety_enum_controls(struct pivariety *pivariety)
 {
 	struct v4l2_subdev *sd = &pivariety->sd;
@@ -1336,7 +1360,7 @@ static int pivariety_probe(struct i2c_client *client)
 {
 	struct device *dev = &client->dev;
 	struct pivariety *pivariety;
-	u32 device_id, firmware_version;
+	u32 device_id, firmware_version, sensor_id;
 	int ret;
 
 	pivariety = devm_kzalloc(&client->dev, sizeof(*pivariety), GFP_KERNEL);
@@ -1384,10 +1408,25 @@ static int pivariety_probe(struct i2c_client *client)
 	}
 
 	ret = pivariety_read(pivariety, DEVICE_VERSION_REG, &firmware_version);
-	if (ret)
+	if (ret) {
 		dev_err(dev, "read firmware version failed\n");
+		goto error_power_off;
+	}
 
-	dev_info(dev, "firmware version: 0x%04X\n", firmware_version);
+	ret = pivariety_read(pivariety, SENSOR_ID_REG, &sensor_id);
+	if (ret) {
+		dev_err(dev, "read sensor ID failed\n");
+		goto error_power_off;
+	}
+
+	pivariety->legacy_uc689 =
+		firmware_version == UC689_REVA_FIRMWARE_VERSION &&
+		sensor_id == UC689_REVA_SENSOR_ID;
+
+	dev_info(dev, "firmware version: 0x%08X, sensor ID: 0x%08X\n",
+		 firmware_version, sensor_id);
+	if (pivariety->legacy_uc689)
+		dev_info(dev, "UC-689 Rev.A legacy firmware detected\n");
 
 	if (pivariety_enum_pixformat(pivariety)) {
 		dev_err(dev, "enum pixformat failed.\n");
@@ -1395,7 +1434,9 @@ static int pivariety_probe(struct i2c_client *client)
 		goto error_power_off;
 	}
 
-	if (pivariety_enum_controls(pivariety)) {
+	if ((pivariety->legacy_uc689 ?
+	     pivariety_init_legacy_controls(pivariety) :
+	     pivariety_enum_controls(pivariety))) {
 		dev_err(dev, "enum controls failed.\n");
 		ret = -ENODEV;
 		goto error_power_off;
