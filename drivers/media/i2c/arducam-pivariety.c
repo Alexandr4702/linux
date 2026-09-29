@@ -80,6 +80,7 @@ struct pivariety {
 	int lanes;
 	int bayer_order_volatile;
 	bool wait_until_free;
+	bool legacy_uc689;
 
 	struct v4l2_ctrl_handler ctrl_handler;
 	struct v4l2_ctrl *ctrls[MAX_CTRLS];
@@ -204,6 +205,12 @@ static int wait_for_free(struct pivariety *pivariety, int interval)
 {
 	u32 value;
 	u32 count = 0;
+
+	/* Firmware 0x10003 does not implement SYSTEM_IDLE_REG. */
+	if (pivariety->legacy_uc689) {
+		msleep(interval);
+		return 0;
+	}
 
 	while (count++ < (1000 / interval)) {
 		int ret = pivariety_read(pivariety, SYSTEM_IDLE_REG, &value);
@@ -1336,7 +1343,7 @@ static int pivariety_probe(struct i2c_client *client)
 {
 	struct device *dev = &client->dev;
 	struct pivariety *pivariety;
-	u32 device_id, firmware_version;
+	u32 device_id, firmware_version, sensor_id;
 	int ret;
 
 	pivariety = devm_kzalloc(&client->dev, sizeof(*pivariety), GFP_KERNEL);
@@ -1384,10 +1391,26 @@ static int pivariety_probe(struct i2c_client *client)
 	}
 
 	ret = pivariety_read(pivariety, DEVICE_VERSION_REG, &firmware_version);
-	if (ret)
-		dev_err(dev, "read firmware version failed\n");
+	if (ret) {
+		dev_warn(dev, "read firmware version failed\n");
+	} else {
+		dev_info(dev, "firmware version: 0x%08X\n",
+			 firmware_version);
 
-	dev_info(dev, "firmware version: 0x%04X\n", firmware_version);
+		if (firmware_version == UC689_REVA_FIRMWARE_VERSION) {
+			ret = pivariety_read(pivariety, SENSOR_ID_REG, &sensor_id);
+			if (ret) {
+				dev_warn(dev, "read sensor ID failed\n");
+			} else {
+				dev_info(dev, "sensor ID: 0x%08X\n", sensor_id);
+				pivariety->legacy_uc689 =
+					sensor_id == UC689_REVA_SENSOR_ID;
+			}
+		}
+	}
+
+	if (pivariety->legacy_uc689)
+		dev_info(dev, "UC-689 Rev.A legacy firmware detected\n");
 
 	if (pivariety_enum_pixformat(pivariety)) {
 		dev_err(dev, "enum pixformat failed.\n");
