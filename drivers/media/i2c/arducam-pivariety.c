@@ -69,6 +69,7 @@ struct pivariety {
 	struct v4l2_mbus_config_mipi_csi2 bus;
 	struct clk *xclk;
 	u32 xclk_freq;
+	s64 link_freq;
 
 	struct gpio_desc *reset_gpio;
 	struct regulator_bulk_data supplies[ARDUCAM_NUM_SUPPLIES];
@@ -1193,6 +1194,20 @@ static struct v4l2_ctrl *v4l2_ctrl_new_arducam(struct v4l2_ctrl_handler *hdl,
 	return v4l2_ctrl_new_custom(hdl, &ctrl_cfg, NULL);
 }
 
+static int pivariety_add_link_freq_control(struct pivariety *pivariety)
+{
+	struct v4l2_ctrl_handler *ctrl_hdlr = &pivariety->ctrl_handler;
+	struct v4l2_ctrl *link_freq;
+
+	link_freq = v4l2_ctrl_new_int_menu(ctrl_hdlr, NULL,
+					   V4L2_CID_LINK_FREQ, 0, 0,
+					   &pivariety->link_freq);
+	if (link_freq)
+		link_freq->flags |= V4L2_CTRL_FLAG_READ_ONLY;
+
+	return ctrl_hdlr->error;
+}
+
 static int pivariety_enum_controls(struct pivariety *pivariety)
 {
 	struct v4l2_subdev *sd = &pivariety->sd;
@@ -1206,12 +1221,12 @@ static int pivariety_enum_controls(struct pivariety *pivariety)
 	num_ctrls = pivariety_get_length_of_set(pivariety, CTRL_INDEX_REG,
 						CTRL_ID_REG);
 	if (num_ctrls < 0)
-		goto err;
+		return -ENODEV;
 
 	v4l2_dbg(1, debug, sd, "%s: num_ctrls = %d\n",
 		 __func__, num_ctrls);
 
-	ret = v4l2_ctrl_handler_init(ctrl_hdlr, num_ctrls);
+	ret = v4l2_ctrl_handler_init(ctrl_hdlr, num_ctrls + 1);
 	if (ret)
 		return ret;
 
@@ -1289,6 +1304,9 @@ static int pivariety_enum_controls(struct pivariety *pivariety)
 	}
 
 	pivariety_write(pivariety, CTRL_INDEX_REG, 0);
+	ret = pivariety_add_link_freq_control(pivariety);
+	if (ret)
+		goto err;
 
 	ret = v4l2_fwnode_device_parse(&client->dev, &props);
 	if (ret)
@@ -1304,6 +1322,7 @@ static int pivariety_enum_controls(struct pivariety *pivariety)
 	v4l2_ctrl_handler_setup(ctrl_hdlr);
 	return 0;
 err:
+	v4l2_ctrl_handler_free(ctrl_hdlr);
 	mutex_destroy(&pivariety->mutex);
 	return -ENODEV;
 }
@@ -1329,6 +1348,12 @@ static int pivariety_parse_dt(struct pivariety *pivariety, struct device *dev)
 	}
 
 	pivariety->bus = ep_cfg.bus.mipi_csi2;
+	if (!ep_cfg.nr_of_link_frequencies) {
+		dev_err(dev, "link-frequency property not found in DT\n");
+		goto error_out;
+	}
+
+	pivariety->link_freq = ep_cfg.link_frequencies[0];
 
 	ret = 0;
 
